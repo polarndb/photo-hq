@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Photo Editing Backend API
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        PHOTOS_TABLE: !Ref PhotosTable
+        ORIGINALS_BUCKET: !Ref OriginalsBucket
+        EDITED_BUCKET: !Ref EditedBucket
+        USER_POOL_ID: !Ref UserPool
+    Tracing: Active
+
+Resources:
+  # Cognito User Pool for Authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+      MfaConfiguration: OPTIONAL
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # S3 Buckets for Photo Storage
+  OriginalsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-originals-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+
+  EditedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-edited-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+
+  # DynamoDB Table for Photo Metadata
+  PhotosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-photos
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: photo_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: version_type
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: photo_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIdIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: UserVersionIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: version_type
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Application
+          Value: PhotoHQ
+
+  # API Gateway
+  PhotoAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+        MaxAge: "'600'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+      TracingEnabled: true
+
+  # Lambda Functions
+  
+  # Upload Photo Function - Generate presigned URL for upload
+  UploadPhotoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-upload-photo
+      CodeUri: src/
+      Handler: upload_photo.lambda_handler
+      Description: Generate presigned URL for photo upload to S3
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref OriginalsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        PostPhoto:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PhotoAPI
+            Path: /photos/upload
+            Method: POST
+
+  # Get Photo Function - Generate presigned URL for download
+  GetPhotoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-get-photo
+      CodeUri: src/
+      Handler: get_photo.lambda_handler
+      Description: Generate presigned URL for photo download from S3
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref OriginalsBucket
+        - S3ReadPolicy:
+            BucketName: !Ref EditedBucket
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        GetPhoto:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PhotoAPI
+            Path: /photos/{photo_id}
+            Method: GET
+
+  # List Photos Function - List user's photos with filtering
+  ListPhotosFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-list-photos
+      CodeUri: src/
+      Handler: list_photos.lambda_handler
+      Description: List user's photos with optional filtering
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        ListPhotos:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PhotoAPI
+            Path: /photos
+            Method: GET
+
+  # Update Photo Function - Generate presigned URL for edited version
+  UpdatePhotoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-update-photo
+      CodeUri: src/
+      Handler: update_photo.lambda_handler
+      Description: Generate presigned URL for uploading edited photo version
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref EditedBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        UpdatePhoto:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PhotoAPI
+            Path: /photos/{photo_id}/edit
+            Method: PUT
+
+  # Delete Photo Function - Delete photo and metadata
+  DeletePhotoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-delete-photo
+      CodeUri: src/
+      Handler: delete_photo.lambda_handler
+      Description: Delete photo and associated metadata
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref OriginalsBucket
+        - S3CrudPolicy:
+            BucketName: !Ref EditedBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        DeletePhoto:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PhotoAPI
+            Path: /photos/{photo_id}
+            Method: DELETE
+
+  # Get Photo Metadata Function
+  GetMetadataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-get-metadata
+      CodeUri: src/
+      Handler: get_metadata.lambda_handler
+      Description: Get photo metadata from DynamoDB
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        GetMetadata:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PhotoAPI
+            Path: /photos/{photo_id}/metadata
+            Method: GET
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${PhotoAPI}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolClientId
+
+  OriginalsBucketName:
+    Description: S3 Bucket for original photos
+    Value: !Ref OriginalsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-OriginalsBucket
+
+  EditedBucketName:
+    Description: S3 Bucket for edited photos
+    Value: !Ref EditedBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-EditedBucket
+
+  PhotosTableName:
+    Description: DynamoDB Table for photo metadata
+    Value: !Ref PhotosTable
+    Export:
+      Name: !Sub ${AWS::StackName}-PhotosTable
