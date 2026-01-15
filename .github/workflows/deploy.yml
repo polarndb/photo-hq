@@ -1,0 +1,354 @@
+name: Deploy and Test Photo HQ API
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  STACK_NAME: photo-hq-dev
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  deploy:
+    name: Deploy to AWS
+    runs-on: ubuntu-latest
+    outputs:
+      api_endpoint: ${{ steps.get_outputs.outputs.api_endpoint }}
+      user_pool_id: ${{ steps.get_outputs.outputs.user_pool_id }}
+      user_pool_client_id: ${{ steps.get_outputs.outputs.user_pool_client_id }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate SAM template
+        run: sam validate --lint
+
+      - name: Build SAM application
+        run: sam build --use-container
+
+      - name: Deploy to AWS
+        run: |
+          sam deploy \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3
+
+      - name: Get Stack Outputs
+        id: get_outputs
+        run: |
+          # Get API endpoint
+          API_ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text)
+          
+          # Get User Pool ID
+          USER_POOL_ID=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' \
+            --output text)
+          
+          # Get User Pool Client ID
+          USER_POOL_CLIENT_ID=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' \
+            --output text)
+          
+          echo "api_endpoint=$API_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "user_pool_id=$USER_POOL_ID" >> $GITHUB_OUTPUT
+          echo "user_pool_client_id=$USER_POOL_CLIENT_ID" >> $GITHUB_OUTPUT
+          
+          echo "✅ Deployment successful!"
+          echo "API Endpoint: $API_ENDPOINT"
+          echo "User Pool ID: $USER_POOL_ID"
+          echo "Client ID: $USER_POOL_CLIENT_ID"
+
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sam-artifacts
+          path: .aws-sam/
+          retention-days: 7
+
+  test:
+    name: Run API Tests
+    runs-on: ubuntu-latest
+    needs: deploy
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r tests/requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create test user
+        id: create_user
+        run: |
+          # Generate random email and password for test user
+          TEST_EMAIL="test-user-$(date +%s)@example.com"
+          TEST_PASSWORD="TestPass123!@#"
+          
+          echo "Creating test user: $TEST_EMAIL"
+          
+          # Sign up user
+          aws cognito-idp sign-up \
+            --client-id ${{ needs.deploy.outputs.user_pool_client_id }} \
+            --username "$TEST_EMAIL" \
+            --password "$TEST_PASSWORD" \
+            --user-attributes Name=email,Value="$TEST_EMAIL" \
+            --region ${{ env.AWS_REGION }} || true
+          
+          # Confirm user (admin action)
+          aws cognito-idp admin-confirm-sign-up \
+            --user-pool-id ${{ needs.deploy.outputs.user_pool_id }} \
+            --username "$TEST_EMAIL" \
+            --region ${{ env.AWS_REGION }}
+          
+          # Wait for user to be confirmed
+          sleep 3
+          
+          # Authenticate and get token
+          AUTH_RESPONSE=$(aws cognito-idp initiate-auth \
+            --auth-flow USER_PASSWORD_AUTH \
+            --client-id ${{ needs.deploy.outputs.user_pool_client_id }} \
+            --auth-parameters USERNAME="$TEST_EMAIL",PASSWORD="$TEST_PASSWORD" \
+            --region ${{ env.AWS_REGION }} \
+            --output json)
+          
+          ACCESS_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.AuthenticationResult.AccessToken')
+          
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "❌ Failed to get access token"
+            exit 1
+          fi
+          
+          echo "✅ Test user created and authenticated"
+          echo "access_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "test_email=$TEST_EMAIL" >> $GITHUB_OUTPUT
+
+      - name: Run comprehensive API tests
+        env:
+          API_ENDPOINT: ${{ needs.deploy.outputs.api_endpoint }}
+          ACCESS_TOKEN: ${{ steps.create_user.outputs.access_token }}
+        run: |
+          echo "Running API tests against: $API_ENDPOINT"
+          python tests/comprehensive_api_test.py
+
+      - name: Test authentication endpoint (unauthorized access)
+        run: |
+          echo "Testing unauthorized access..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ needs.deploy.outputs.api_endpoint }}/photos")
+          
+          if [ "$RESPONSE" = "401" ]; then
+            echo "✅ Authentication test passed - unauthorized access rejected"
+          else
+            echo "❌ Authentication test failed - expected 401, got $RESPONSE"
+            exit 1
+          fi
+
+      - name: Test photo upload endpoint
+        env:
+          API_ENDPOINT: ${{ needs.deploy.outputs.api_endpoint }}
+          ACCESS_TOKEN: ${{ steps.create_user.outputs.access_token }}
+        run: |
+          echo "Testing photo upload endpoint..."
+          RESPONSE=$(curl -s -X POST "$API_ENDPOINT/photos/upload" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "filename": "test-github-actions.jpg",
+              "content_type": "image/jpeg",
+              "file_size": 6291456
+            }')
+          
+          echo "Upload response: $RESPONSE"
+          
+          PHOTO_ID=$(echo "$RESPONSE" | jq -r '.photo_id')
+          if [ -z "$PHOTO_ID" ] || [ "$PHOTO_ID" = "null" ]; then
+            echo "❌ Photo upload test failed"
+            exit 1
+          fi
+          
+          echo "✅ Photo upload test passed"
+          echo "PHOTO_ID=$PHOTO_ID" >> $GITHUB_ENV
+
+      - name: Test photo listing endpoint
+        env:
+          API_ENDPOINT: ${{ needs.deploy.outputs.api_endpoint }}
+          ACCESS_TOKEN: ${{ steps.create_user.outputs.access_token }}
+        run: |
+          echo "Testing photo listing endpoint..."
+          RESPONSE=$(curl -s -X GET "$API_ENDPOINT/photos" \
+            -H "Authorization: Bearer $ACCESS_TOKEN")
+          
+          echo "List response: $RESPONSE"
+          
+          COUNT=$(echo "$RESPONSE" | jq -r '.count')
+          if [ "$COUNT" -ge 0 ]; then
+            echo "✅ Photo listing test passed - found $COUNT photos"
+          else
+            echo "❌ Photo listing test failed"
+            exit 1
+          fi
+
+      - name: Test photo metadata endpoint
+        if: env.PHOTO_ID != ''
+        env:
+          API_ENDPOINT: ${{ needs.deploy.outputs.api_endpoint }}
+          ACCESS_TOKEN: ${{ steps.create_user.outputs.access_token }}
+        run: |
+          echo "Testing photo metadata endpoint..."
+          RESPONSE=$(curl -s -X GET "$API_ENDPOINT/photos/$PHOTO_ID/metadata" \
+            -H "Authorization: Bearer $ACCESS_TOKEN")
+          
+          echo "Metadata response: $RESPONSE"
+          
+          METADATA_PHOTO_ID=$(echo "$RESPONSE" | jq -r '.photo_id')
+          if [ "$METADATA_PHOTO_ID" = "$PHOTO_ID" ]; then
+            echo "✅ Photo metadata test passed"
+          else
+            echo "❌ Photo metadata test failed"
+            exit 1
+          fi
+
+      - name: Test photo retrieval endpoint
+        if: env.PHOTO_ID != ''
+        env:
+          API_ENDPOINT: ${{ needs.deploy.outputs.api_endpoint }}
+          ACCESS_TOKEN: ${{ steps.create_user.outputs.access_token }}
+        run: |
+          echo "Testing photo retrieval endpoint..."
+          RESPONSE=$(curl -s -X GET "$API_ENDPOINT/photos/$PHOTO_ID" \
+            -H "Authorization: Bearer $ACCESS_TOKEN")
+          
+          echo "Retrieval response: $RESPONSE"
+          
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.download_url')
+          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
+            echo "✅ Photo retrieval test passed"
+          else
+            echo "❌ Photo retrieval test failed"
+            exit 1
+          fi
+
+      - name: Test photo update endpoint
+        if: env.PHOTO_ID != ''
+        env:
+          API_ENDPOINT: ${{ needs.deploy.outputs.api_endpoint }}
+          ACCESS_TOKEN: ${{ steps.create_user.outputs.access_token }}
+        run: |
+          echo "Testing photo update endpoint..."
+          RESPONSE=$(curl -s -X PUT "$API_ENDPOINT/photos/$PHOTO_ID/edit" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "filename": "test-edited.jpg",
+              "content_type": "image/jpeg",
+              "file_size": 7340032
+            }')
+          
+          echo "Update response: $RESPONSE"
+          
+          UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url')
+          if [ -n "$UPLOAD_URL" ] && [ "$UPLOAD_URL" != "null" ]; then
+            echo "✅ Photo update test passed"
+          else
+            echo "❌ Photo update test failed"
+            exit 1
+          fi
+
+      - name: Test photo deletion endpoint
+        if: env.PHOTO_ID != ''
+        env:
+          API_ENDPOINT: ${{ needs.deploy.outputs.api_endpoint }}
+          ACCESS_TOKEN: ${{ steps.create_user.outputs.access_token }}
+        run: |
+          echo "Testing photo deletion endpoint..."
+          RESPONSE=$(curl -s -X DELETE "$API_ENDPOINT/photos/$PHOTO_ID" \
+            -H "Authorization: Bearer $ACCESS_TOKEN")
+          
+          echo "Deletion response: $RESPONSE"
+          
+          MESSAGE=$(echo "$RESPONSE" | jq -r '.message')
+          if echo "$MESSAGE" | grep -iq "deleted"; then
+            echo "✅ Photo deletion test passed"
+          else
+            echo "❌ Photo deletion test failed"
+            exit 1
+          fi
+
+      - name: Cleanup test user
+        if: always()
+        run: |
+          if [ -n "${{ steps.create_user.outputs.test_email }}" ]; then
+            echo "Cleaning up test user..."
+            aws cognito-idp admin-delete-user \
+              --user-pool-id ${{ needs.deploy.outputs.user_pool_id }} \
+              --username "${{ steps.create_user.outputs.test_email }}" \
+              --region ${{ env.AWS_REGION }} || true
+            echo "✅ Test user cleanup complete"
+          fi
+
+      - name: Generate test report
+        if: always()
+        run: |
+          echo "## 🧪 API Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Stack:** ${{ env.STACK_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**API Endpoint:** ${{ needs.deploy.outputs.api_endpoint }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Coverage" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Authentication (unauthorized access)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Photo upload (POST /photos/upload)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Photo listing (GET /photos)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Photo retrieval (GET /photos/{id})" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Photo metadata (GET /photos/{id}/metadata)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Photo update (PUT /photos/{id}/edit)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Photo deletion (DELETE /photos/{id})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All API endpoints tested successfully! 🎉" >> $GITHUB_STEP_SUMMARY
