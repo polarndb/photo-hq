@@ -1,5 +1,9 @@
 # Photo HQ - Serverless Photo Editing Backend API
 
+[![Deploy and Test](https://github.com/polarndb/photo-hq/actions/workflows/deploy.yml/badge.svg)](https://github.com/polarndb/photo-hq/actions/workflows/deploy.yml)
+[![AWS SAM](https://img.shields.io/badge/AWS-SAM-orange.svg)](https://aws.amazon.com/serverless/sam/)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
+
 A serverless photo editing backend API built with AWS SAM, providing secure photo storage, version management, and CRUD operations for photo editing applications.
 
 ## Architecture Overview
@@ -111,6 +115,129 @@ A serverless photo editing backend API built with AWS SAM, providing secure phot
 - Python 3.11
 - Git
 
+## CI/CD with GitHub Actions
+
+This project includes automated deployment and testing using GitHub Actions. The workflow automatically deploys to AWS and runs comprehensive API tests on every push to the main branch.
+
+📚 **[Complete CI/CD Setup Guide](CI_CD_SETUP.md)** - Detailed instructions, troubleshooting, and best practices
+
+### Setting Up GitHub Actions
+
+#### 1. Configure GitHub Secrets
+
+Navigate to your repository settings and add the following secrets under `Settings > Secrets and variables > Actions`:
+
+| Secret Name | Description | Example Value |
+|------------|-------------|---------------|
+| `AWS_ACCESS_KEY_ID` | AWS IAM user access key ID | `AKIAIOSFODNN7EXAMPLE` |
+| `AWS_SECRET_ACCESS_KEY` | AWS IAM user secret access key | `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` |
+| `AWS_REGION` | AWS region for deployment (optional, defaults to us-east-1) | `us-east-1` |
+
+**Important Security Notes:**
+- Never commit AWS credentials to your repository
+- Use IAM users with minimal required permissions
+- Rotate access keys regularly
+- Enable MFA for IAM users
+- Consider using GitHub OIDC for keyless authentication (more secure)
+
+#### 2. Required IAM Permissions
+
+The IAM user needs the following permissions:
+- CloudFormation: Full access to create/update/delete stacks
+- Lambda: Create and manage functions
+- API Gateway: Create and manage REST APIs
+- S3: Create buckets and manage objects
+- DynamoDB: Create and manage tables
+- Cognito: Create and manage user pools
+- IAM: Create roles for Lambda functions
+- CloudWatch: Create log groups
+- X-Ray: Enable tracing
+
+**Recommended IAM Policy:**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:*",
+        "lambda:*",
+        "apigateway:*",
+        "s3:*",
+        "dynamodb:*",
+        "cognito-idp:*",
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "logs:*",
+        "xray:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+#### 3. Workflow Features
+
+The GitHub Actions workflow (`deploy.yml`) includes:
+
+**Deployment Job:**
+- ✅ Validates SAM template
+- ✅ Builds Lambda functions in container
+- ✅ Deploys to AWS using SAM CLI
+- ✅ Extracts stack outputs (API endpoint, Cognito details)
+- ✅ Uploads deployment artifacts
+
+**Testing Job:**
+- ✅ Creates temporary test user in Cognito
+- ✅ Authenticates and obtains JWT token
+- ✅ Tests authentication (unauthorized access rejection)
+- ✅ Tests photo upload endpoint
+- ✅ Tests photo listing with filters
+- ✅ Tests photo retrieval (download URL generation)
+- ✅ Tests photo metadata endpoint
+- ✅ Tests photo update (edited version upload)
+- ✅ Tests photo deletion and verification
+- ✅ Tests CORS headers
+- ✅ Tests error handling (invalid inputs, 404s)
+- ✅ Cleans up test user automatically
+- ✅ Generates comprehensive test report
+
+**Triggers:**
+- Automatic: Push to `main` branch
+- Manual: `workflow_dispatch` (Run from GitHub Actions UI)
+
+#### 4. Viewing Workflow Status
+
+- **GitHub UI**: Navigate to `Actions` tab in your repository
+- **README Badge**: Shows current deployment status
+- **Notifications**: Configure GitHub notifications for workflow failures
+
+#### 5. Manual Deployment Trigger
+
+You can manually trigger deployment from GitHub:
+1. Go to `Actions` tab
+2. Select `Deploy and Test Photo HQ API` workflow
+3. Click `Run workflow` button
+4. Select branch and click `Run workflow`
+
+### Alternative: GitHub OIDC (Recommended for Production)
+
+For enhanced security, use GitHub OIDC instead of access keys:
+
+1. Create an IAM OIDC provider for GitHub
+2. Create an IAM role with trust policy for GitHub Actions
+3. Update workflow to use `aws-actions/configure-aws-credentials@v4` with `role-to-assume`
+
+See [GitHub's OIDC documentation](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services) for details.
+
 ## Installation
 
 ### 1. Install AWS SAM CLI
@@ -135,7 +262,25 @@ cd photo-hq
 
 ## Deployment
 
-### Quick Deploy
+### Automated Deployment (GitHub Actions)
+
+The recommended deployment method is through GitHub Actions:
+
+1. **Configure GitHub Secrets** (see CI/CD section above)
+2. **Push to main branch** or **manually trigger workflow**
+3. **Monitor deployment** in GitHub Actions tab
+4. **Review test results** in workflow summary
+
+The workflow automatically:
+- Builds and deploys the application
+- Runs comprehensive API tests
+- Reports status via badges and notifications
+
+### Manual Deployment
+
+For local development or one-time deployments:
+
+#### Quick Deploy
 
 ```bash
 # Build the application
@@ -152,13 +297,13 @@ sam deploy --guided
 # - Save arguments to configuration file: Y
 ```
 
-### Subsequent Deployments
+#### Subsequent Deployments
 
 ```bash
 sam build && sam deploy
 ```
 
-### Custom Stack Name
+#### Custom Stack Name
 
 ```bash
 sam deploy --stack-name photo-hq-prod --parameter-overrides ParameterKey=Environment,ParameterValue=prod
@@ -712,7 +857,28 @@ Set up CloudWatch alarms for:
 
 ## Testing
 
-### Local Testing (SAM Local)
+### Automated Testing (GitHub Actions)
+
+Every deployment via GitHub Actions automatically runs a comprehensive test suite that includes:
+
+- **Authentication Tests**: Verifies proper JWT authentication and authorization
+- **Photo Upload Tests**: Tests presigned URL generation and metadata creation
+- **Photo Listing Tests**: Tests pagination and filtering
+- **Photo Retrieval Tests**: Tests download URL generation
+- **Photo Metadata Tests**: Validates metadata storage and retrieval
+- **Photo Update Tests**: Tests edited version upload
+- **Photo Deletion Tests**: Verifies complete resource cleanup
+- **Error Handling Tests**: Tests validation and error responses
+- **CORS Tests**: Validates cross-origin headers
+
+Test results are available in:
+- GitHub Actions workflow summary
+- Individual step logs
+- Test report artifacts
+
+### Manual Testing
+
+#### Local Testing (SAM Local)
 
 ```bash
 # Start API locally
@@ -722,7 +888,7 @@ sam local start-api
 sam local invoke UploadPhotoFunction -e events/upload.json
 ```
 
-### Create Test Events
+#### Create Test Events
 
 `events/upload.json`:
 ```json
@@ -740,13 +906,17 @@ sam local invoke UploadPhotoFunction -e events/upload.json
 }
 ```
 
-### Integration Testing
+#### Integration Testing
 
 Use the provided test scripts:
 
 ```bash
+# Set environment variables
+export API_ENDPOINT="https://your-api-id.execute-api.us-east-1.amazonaws.com/prod"
+export ACCESS_TOKEN="your-jwt-token"
+
 # Run full API test suite
-python tests/integration_test.py --api-url $API_ENDPOINT --token $JWT_TOKEN
+python tests/comprehensive_api_test.py
 ```
 
 ## Troubleshooting
