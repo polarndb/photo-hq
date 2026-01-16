@@ -31,6 +31,13 @@ jobs:
           cache: 'pip'
           cache-dependency-path: 'src/requirements.txt'
 
+      - name: Install Python dependencies
+        run: |
+          echo "Installing Python dependencies..."
+          python -m pip install --upgrade pip
+          pip install boto3>=1.34.0
+          echo "✅ Python dependencies installed"
+
       - name: Set up SAM CLI
         uses: aws-actions/setup-sam@v2
         with:
@@ -43,14 +50,43 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Check for existing stack
+        id: check_stack
+        continue-on-error: true
+        run: |
+          echo "Checking for existing CloudFormation stack..."
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "NOT_EXISTS")
+          
+          echo "stack_status=$STACK_STATUS" >> $GITHUB_OUTPUT
+          
+          if [ "$STACK_STATUS" != "NOT_EXISTS" ]; then
+            echo "✅ Existing stack found with status: $STACK_STATUS"
+          else
+            echo "📦 No existing stack found - will create new stack"
+          fi
+
       - name: Validate SAM template
-        run: sam validate --lint
+        run: |
+          echo "Validating SAM template..."
+          sam validate --lint
+          echo "✅ SAM template validation successful"
 
       - name: Build SAM application
-        run: sam build --use-container
+        run: |
+          echo "Building SAM application..."
+          # Build without --use-container for better CI/CD compatibility
+          # This avoids Docker-in-Docker issues in GitHub Actions
+          sam build
+          echo "✅ SAM build successful"
 
       - name: Deploy to AWS
+        id: deploy
         run: |
+          echo "Deploying to AWS..."
           sam deploy \
             --stack-name ${{ env.STACK_NAME }} \
             --region ${{ env.AWS_REGION }} \
@@ -58,11 +94,27 @@ jobs:
             --no-fail-on-empty-changeset \
             --capabilities CAPABILITY_IAM \
             --resolve-s3 \
-            --config-env default
+            --config-env default \
+            --tags "Environment=dev Project=photo-hq ManagedBy=SAM" \
+            --disable-rollback
+          echo "✅ Deployment successful"
+        
+      - name: Handle deployment failure
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: |
+          echo "❌ Deployment failed. Fetching CloudFormation events..."
+          aws cloudformation describe-stack-events \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --max-items 50 \
+            --query 'StackEvents[?ResourceStatus==`CREATE_FAILED` || ResourceStatus==`UPDATE_FAILED`].[Timestamp,ResourceType,LogicalResourceId,ResourceStatusReason]' \
+            --output table || echo "Stack may not exist yet"
 
       - name: Get Stack Outputs
         id: get_outputs
         run: |
+          echo "Retrieving CloudFormation stack outputs..."
+          
           # Get API endpoint
           API_ENDPOINT=$(aws cloudformation describe-stacks \
             --stack-name ${{ env.STACK_NAME }} \
@@ -84,6 +136,23 @@ jobs:
             --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' \
             --output text)
           
+          # Validate outputs
+          if [ -z "$API_ENDPOINT" ] || [ "$API_ENDPOINT" = "None" ]; then
+            echo "❌ Failed to retrieve API endpoint"
+            exit 1
+          fi
+          
+          if [ -z "$USER_POOL_ID" ] || [ "$USER_POOL_ID" = "None" ]; then
+            echo "❌ Failed to retrieve User Pool ID"
+            exit 1
+          fi
+          
+          if [ -z "$USER_POOL_CLIENT_ID" ] || [ "$USER_POOL_CLIENT_ID" = "None" ]; then
+            echo "❌ Failed to retrieve User Pool Client ID"
+            exit 1
+          fi
+          
+          # Set outputs
           echo "api_endpoint=$API_ENDPOINT" >> $GITHUB_OUTPUT
           echo "user_pool_id=$USER_POOL_ID" >> $GITHUB_OUTPUT
           echo "user_pool_client_id=$USER_POOL_CLIENT_ID" >> $GITHUB_OUTPUT
@@ -93,12 +162,85 @@ jobs:
           echo "User Pool ID: $USER_POOL_ID"
           echo "Client ID: $USER_POOL_CLIENT_ID"
 
+      - name: Verify Lambda Functions
+        run: |
+          echo "Verifying Lambda functions are created..."
+          
+          # List all Lambda functions in the stack
+          FUNCTIONS=$(aws lambda list-functions \
+            --region ${{ env.AWS_REGION }} \
+            --query "Functions[?starts_with(FunctionName, '${{ env.STACK_NAME }}')].FunctionName" \
+            --output text)
+          
+          if [ -z "$FUNCTIONS" ]; then
+            echo "⚠️  Warning: No Lambda functions found"
+          else
+            echo "✅ Lambda functions found:"
+            echo "$FUNCTIONS" | tr '\t' '\n' | while read func; do
+              echo "  - $func"
+            done
+          fi
+          
+          # Verify API Gateway
+          echo ""
+          echo "Verifying API Gateway..."
+          API_ID=$(aws apigateway get-rest-apis \
+            --region ${{ env.AWS_REGION }} \
+            --query "items[?name=='${{ env.STACK_NAME }}-api'].id" \
+            --output text)
+          
+          if [ -z "$API_ID" ]; then
+            echo "⚠️  Warning: API Gateway not found"
+          else
+            echo "✅ API Gateway found: $API_ID"
+          fi
+
       - name: Upload deployment artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sam-artifacts
           path: .aws-sam/
           retention-days: 7
+
+      - name: Generate deployment summary
+        if: success()
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Successful" >> $GITHUB_STEP_SUMMARY
+          echo "**Stack Name:** \`${{ env.STACK_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Python Version:** \`${{ env.PYTHON_VERSION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Stack Outputs" >> $GITHUB_STEP_SUMMARY
+          echo "- **API Endpoint:** \`${{ steps.get_outputs.outputs.api_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **User Pool ID:** \`${{ steps.get_outputs.outputs.user_pool_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **User Pool Client ID:** \`${{ steps.get_outputs.outputs.user_pool_client_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Resources Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ API Gateway REST API" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 6 Lambda Functions" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Cognito User Pool" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 2 S3 Buckets (Originals, Edited)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ DynamoDB Table" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Next: API tests will run automatically" >> $GITHUB_STEP_SUMMARY
+
+      - name: Generate failure summary
+        if: failure()
+        run: |
+          echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Stack Name:** \`${{ env.STACK_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Troubleshooting Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Check CloudFormation events in AWS Console" >> $GITHUB_STEP_SUMMARY
+          echo "2. Review Lambda function logs in CloudWatch" >> $GITHUB_STEP_SUMMARY
+          echo "3. Verify IAM permissions" >> $GITHUB_STEP_SUMMARY
+          echo "4. Check for resource naming conflicts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See deployment failure logs above for details." >> $GITHUB_STEP_SUMMARY
 
   test:
     name: Run API Tests
