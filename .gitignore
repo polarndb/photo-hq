@@ -67,3 +67,6 @@ docs/_build/
 *.tmp
 *.bak
 .temp/
+
+# Agent-generated files
+.agents/
