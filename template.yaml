@@ -7,13 +7,20 @@ Globals:
     Runtime: python3.11
     Timeout: 30
     MemorySize: 512
+    Architectures:
+      - x86_64
     Environment:
       Variables:
         PHOTOS_TABLE: !Ref PhotosTable
         ORIGINALS_BUCKET: !Ref OriginalsBucket
         EDITED_BUCKET: !Ref EditedBucket
         USER_POOL_ID: !Ref UserPool
+        LOG_LEVEL: INFO
     Tracing: Active
+    Tags:
+      Application: PhotoHQ
+      Environment: dev
+      ManagedBy: SAM
 
 Resources:
   # Cognito User Pool for Authentication
@@ -57,6 +64,8 @@ Resources:
   # S3 Buckets for Photo Storage
   OriginalsBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub ${AWS::StackName}-originals-${AWS::AccountId}
       BucketEncryption:
@@ -87,9 +96,18 @@ Resources:
             AllowedOrigins:
               - '*'
             MaxAge: 3000
+      Tags:
+        - Key: Application
+          Value: PhotoHQ
+        - Key: Environment
+          Value: dev
+        - Key: ManagedBy
+          Value: SAM
 
   EditedBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub ${AWS::StackName}-edited-${AWS::AccountId}
       BucketEncryption:
@@ -120,6 +138,13 @@ Resources:
             AllowedOrigins:
               - '*'
             MaxAge: 3000
+      Tags:
+        - Key: Application
+          Value: PhotoHQ
+        - Key: Environment
+          Value: dev
+        - Key: ManagedBy
+          Value: SAM
 
   # DynamoDB Table for Photo Metadata
   PhotosTable:
@@ -199,6 +224,14 @@ Resources:
             BucketName: !Ref OriginalsBucket
         - DynamoDBCrudPolicy:
             TableName: !Ref PhotosTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
       Events:
         PostPhoto:
           Type: Api
@@ -222,6 +255,14 @@ Resources:
             BucketName: !Ref EditedBucket
         - DynamoDBReadPolicy:
             TableName: !Ref PhotosTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
       Events:
         GetPhoto:
           Type: Api
@@ -241,6 +282,14 @@ Resources:
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref PhotosTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
       Events:
         ListPhotos:
           Type: Api
@@ -262,6 +311,14 @@ Resources:
             BucketName: !Ref EditedBucket
         - DynamoDBCrudPolicy:
             TableName: !Ref PhotosTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
       Events:
         UpdatePhoto:
           Type: Api
@@ -285,6 +342,14 @@ Resources:
             BucketName: !Ref EditedBucket
         - DynamoDBCrudPolicy:
             TableName: !Ref PhotosTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
       Events:
         DeletePhoto:
           Type: Api
@@ -304,6 +369,14 @@ Resources:
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref PhotosTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
       Events:
         GetMetadata:
           Type: Api
