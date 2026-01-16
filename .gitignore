@@ -26,11 +26,17 @@ wheels/
 MANIFEST
 *.pyc
 
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
 # Virtual environments
 venv/
 ENV/
 env/
 .venv
+env.bak/
+venv.bak/
 
 # IDE
 .vscode/
@@ -58,7 +64,6 @@ logs/
 
 # AWS
 *.pem
-.aws-sam
 
 # Documentation build
 docs/_build/
